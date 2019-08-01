@@ -39,13 +39,21 @@ func init() {
 // prefix is the transformation helper function prefix
 //
 func GoTransform(source, target *expr.AttributeExpr, sourceVar, targetVar string, sourceCtx, targetCtx *AttributeContext, prefix string) (string, []*TransformFunctionData, error) {
+	return GoTransformToVar(source, target, sourceVar, targetVar, sourceCtx, targetCtx, prefix, true)
+}
+
+// GoTransformToVar is similar to GoTransform except that it initializes the
+// target data structure to the variable in targetVar. If newVar is set to
+// false the target variable is initialized with "=" operator, otherwise ":="
+// operator is used. See GoTypeTransform for more information.
+func GoTransformToVar(source, target *expr.AttributeExpr, sourceVar, targetVar string, sourceCtx, targetCtx *AttributeContext, prefix string, newVar bool) (string, []*TransformFunctionData, error) {
 	ta := &TransformAttrs{
 		SourceCtx: sourceCtx,
 		TargetCtx: targetCtx,
 		Prefix:    prefix,
 	}
 
-	code, err := transformAttribute(source, target, sourceVar, targetVar, true, ta)
+	code, err := transformAttribute(source, target, sourceVar, targetVar, newVar, ta)
 	if err != nil {
 		return "", nil, err
 	}
@@ -295,7 +303,8 @@ func transformMap(source, target *expr.Map, sourceVar, targetVar string, newVar 
 		"NewVar":         newVar,
 		"TransformAttrs": ta,
 		"LoopVar":        "",
-		"IsStruct":       expr.IsObject(target.ElemType.Type),
+		"IsKeyStruct":    expr.IsObject(target.KeyType.Type),
+		"IsElemStruct":   expr.IsObject(target.ElemType.Type),
 	}
 	if depth := MapDepth(target); depth > 0 {
 		data["LoopVar"] = string(97 + depth)
@@ -325,12 +334,12 @@ func transformAttributeHelpers(source, target *expr.AttributeExpr, ta *Transform
 	var other []*TransformFunctionData
 	switch {
 	case expr.IsArray(source.Type):
-		if other, err = transformAttributeHelpers(expr.AsArray(source.Type).ElemType, expr.AsArray(target.Type).ElemType, ta, seen); err == nil {
+		if other, err = collectHelpers(expr.AsArray(source.Type).ElemType, expr.AsArray(target.Type).ElemType, true, ta, seen); err == nil {
 			helpers = append(helpers, other...)
 		}
 	case expr.IsMap(source.Type):
 		sm, tm := expr.AsMap(source.Type), expr.AsMap(target.Type)
-		if other, err = transformAttributeHelpers(sm.ElemType, tm.ElemType, ta, seen); err == nil {
+		if other, err = collectHelpers(sm.ElemType, tm.ElemType, true, ta, seen); err == nil {
 			helpers = append(helpers, other...)
 			if other, err = collectHelpers(sm.KeyType, tm.KeyType, true, ta, seen); err == nil {
 				helpers = append(helpers, other...)
@@ -466,8 +475,12 @@ for {{ .LoopVar }}, val := range {{ .SourceVar }} {
 
 	transformGoMapTmpl = `{{ .TargetVar }} {{ if .NewVar }}:={{ else }}={{ end }} make(map[{{ .KeyTypeRef }}]{{ .ElemTypeRef }}, len({{ .SourceVar }}))
 for key, val := range {{ .SourceVar }} {
+{{ if .IsKeyStruct -}}
+	tk := {{ transformHelperName .SourceKey .TargetKey .TransformAttrs -}}(val)
+{{ else -}}
   {{ transformAttribute .SourceKey .TargetKey "key" "tk" true .TransformAttrs -}}
-{{ if .IsStruct -}}
+{{ end -}}
+{{ if .IsElemStruct -}}
 	{{ .TargetVar }}[tk] = {{ transformHelperName .SourceElem .TargetElem .TransformAttrs -}}(val)
 {{ else -}}
 	{{ transformAttribute .SourceElem .TargetElem "val" (printf "tv%s" .LoopVar) true .TransformAttrs -}}

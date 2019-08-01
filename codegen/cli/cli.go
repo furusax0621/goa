@@ -132,6 +132,8 @@ type (
 		ReturnIsStruct bool
 		// ReturnTypeName is the fully-qualified name of the payload.
 		ReturnTypeName string
+		// ReturnTypePkg is the package name where the payload is present.
+		ReturnTypePkg string
 		// Args is the list of arguments for the constructor.
 		Args []*PayloadInitArgData
 	}
@@ -149,6 +151,10 @@ type (
 		// FieldPointer if true indicates that the field in the payload is a
 		// pointer.
 		FieldPointer bool
+		// FieldType is the type of the field in the payload.
+		FieldType expr.DataType
+		// Type is the argument type.
+		Type expr.DataType
 	}
 )
 
@@ -301,6 +307,9 @@ func PayloadBuilderSection(buildFunction *BuildFunctionData) *codegen.SectionTem
 		Name:   "cli-build-payload",
 		Source: buildPayloadT,
 		Data:   buildFunction,
+		FuncMap: map[string]interface{}{
+			"fieldCode": fieldCode,
+		},
 	}
 }
 
@@ -540,6 +549,78 @@ func generateExample(sub *SubcommandData, svc string) {
 	sub.Example = ex
 }
 
+// fieldCode generates code to initialize the data structures fields
+// from the given args. It is used only in templates.
+func fieldCode(args []*PayloadInitArgData, code, targetVar, targetName, targetPkg string) string {
+	var init, post string
+	{
+		scope := codegen.NewNameScope()
+		scope.Unique(targetVar)
+
+		if code == "" {
+			init = fmt.Sprintf("%s := &%s{\n", targetVar, targetName)
+		}
+		for _, arg := range args {
+			if arg.FieldName == "" {
+				continue
+			}
+			if expr.Equal(arg.Type, arg.FieldType) {
+				// arg type and the data structure field type are the same
+				deref := ""
+				if !arg.Pointer && arg.FieldPointer && expr.IsPrimitive(arg.FieldType) {
+					deref = "&"
+				}
+				if code != "" {
+					post += fmt.Sprintf("%s.%s = %s%s\n", targetVar, arg.FieldName, deref, arg.Name)
+					continue
+				}
+				init += fmt.Sprintf("%s: %s%s,\n", arg.FieldName, deref, arg.Name)
+			} else if _, isut := arg.FieldType.(expr.UserType); isut && expr.IsPrimitive(arg.FieldType) {
+				// aliased primitive type
+				t := scope.GoFullTypeRef(&expr.AttributeExpr{Type: arg.FieldType}, targetPkg)
+				cast := fmt.Sprintf("%s(%s)", t, arg.Name)
+				if arg.Pointer {
+					cast = fmt.Sprintf("%s(*%s)", t, arg.Name)
+				}
+				if arg.FieldPointer {
+					post += fmt.Sprintf("tmp%s := %s\n%s.%s = &tmp%s\n", arg.Name, cast, targetVar, arg.FieldName, arg.Name)
+					continue
+				}
+				if code != "" {
+					post += fmt.Sprintf("%s.%s = %s\n", targetVar, arg.FieldName, cast)
+					continue
+				}
+				init += fmt.Sprintf("%s: %s,\n", arg.FieldName, cast)
+			} else {
+				// aliased non-primitive type (array or map). We can assume that the
+				// array and map elements never contains another user type because
+				// goa does not allow user types to be sent over params and headers
+				srcctx := codegen.NewAttributeContext(arg.Pointer, false, true, "", scope)
+				tgtctx := codegen.NewAttributeContext(arg.FieldPointer, false, true, targetPkg, scope)
+				c, h, err := codegen.GoTransformToVar(
+					&expr.AttributeExpr{Type: arg.Type}, &expr.AttributeExpr{Type: arg.FieldType},
+					arg.Name, fmt.Sprintf("%s.%s", targetVar, arg.FieldName), srcctx, tgtctx, "", false)
+				if err != nil {
+					panic(err) // bug
+				}
+				if len(h) > 0 {
+					// bug. A user type is used in params/headers which is not allowed.
+					// Fix validation to catch these.
+					panic("expected 0 transform helpers but got at least 1")
+				}
+				post += c + "\n"
+			}
+		}
+		if init != "" {
+			init += "}\n"
+		}
+	}
+	if code != "" {
+		return strings.Trim(post, "\n")
+	}
+	return strings.Trim(init+post, "\n")
+}
+
 // input: []string
 const usageT = `// UsageCommands returns the set of commands and sub-commands using the format
 //
@@ -672,49 +753,40 @@ Example:
 // input: buildFunctionData
 const buildPayloadT = `{{ printf "%s builds the payload for the %s %s endpoint from CLI flags." .Name .ServiceName .MethodName | comment }}
 func {{ .Name }}({{ range .FormalParams }}{{ . }} string, {{ end }}) ({{ .ResultType }}, error) {
-	{{- if .CheckErr }}
+{{- if .CheckErr }}
 	var err error
+{{- end }}
+{{- range .Fields }}
+	{{- if .VarName }}
+		var {{ .VarName }} {{ .TypeRef }}
+		{
+			{{ .Init }}
+		}
 	{{- end }}
-	{{- range .Fields }}
-		{{- if .VarName }}
-	var {{ .VarName }} {{ .TypeRef }}
-	{
-		{{ .Init }}
-	}
+{{- end }}
+{{- with .PayloadInit }}
+	{{- if .Code }}
+		{{ .Code }}
+		{{- if .ReturnTypeAttribute }}
+			res := &{{ .ReturnTypeName }}{
+				{{ .ReturnTypeAttribute }}: v,
+			}
 		{{- end }}
 	{{- end }}
-	{{- with .PayloadInit }}
-
-		{{- if .Code }}
-	{{ .Code }}
-			{{- if .ReturnTypeAttribute }}
-	res := &{{ .ReturnTypeName }}{
-		{{ .ReturnTypeAttribute }}: v,
-	}
+	{{- if .ReturnIsStruct }}
+		{{- if .ReturnTypeAttribute }}
+			{{- $code := (fieldCode .Args .Code "res" .ReturnTypeName .ReturnTypePkg) }}
+			{{- if $code }}
+				{{ $code }}
 			{{- end }}
-			{{- if .ReturnIsStruct }}
-				{{- range .Args }}
-					{{- if .FieldName }}
-	{{ if $.PayloadInit.ReturnTypeAttribute }}res{{ else }}v{{ end }}.{{ .FieldName }} = {{ if and (not .Pointer) .FieldPointer }}&{{ end }}{{ .Name }}
-				{{- end }}
-			{{- end }}
-		{{- end }}
-	return {{ if .ReturnTypeAttribute }}res{{ else }}v{{ end }}, nil
-
 		{{- else }}
-			{{- if .ReturnIsStruct }}
-	payload := &{{ .ReturnTypeName }}{
-				{{- range .Args }}
-					{{- if .FieldName }}
-		{{ .FieldName }}: {{ if and (not .Pointer) .FieldPointer }}&{{ end }}{{ .Name }},
-					{{- end }}
-				{{- end }}
-	}
-	return payload, nil
-			{{-  end }}
-
+			{{- $code := (fieldCode .Args .Code "v" .ReturnTypeName .ReturnTypePkg) }}
+			{{- if $code }}
+				{{ $code }}
+			{{- end }}
 		{{- end }}
-
 	{{- end }}
+	return {{ if .ReturnTypeAttribute }}res{{ else }}v{{ end }}, nil
+{{- end }}
 }
 `

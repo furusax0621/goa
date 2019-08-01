@@ -1,7 +1,9 @@
 package codegen
 
 import (
+	"fmt"
 	"path/filepath"
+	"strings"
 
 	"goa.design/goa/v3/codegen"
 	"goa.design/goa/v3/expr"
@@ -176,6 +178,9 @@ func serverType(genpkg string, svc *expr.HTTPServiceExpr, seen map[string]struct
 				Name:   "server-payload-init",
 				Source: serverTypeInitT,
 				Data:   init,
+				FuncMap: map[string]interface{}{
+					"fieldCode": fieldCode,
+				},
 			})
 		}
 		if adata.ServerStream != nil && adata.ServerStream.Payload != nil {
@@ -184,6 +189,9 @@ func serverType(genpkg string, svc *expr.HTTPServiceExpr, seen map[string]struct
 					Name:   "server-payload-init",
 					Source: serverTypeInitT,
 					Data:   init,
+					FuncMap: map[string]interface{}{
+						"fieldCode": fieldCode,
+					},
 				})
 			}
 		}
@@ -201,6 +209,77 @@ func serverType(genpkg string, svc *expr.HTTPServiceExpr, seen map[string]struct
 	return &codegen.File{Path: path, SectionTemplates: sections}
 }
 
+// fieldCode initializes the target type fields with the given args.
+func fieldCode(args []*InitArgData, code, targetVar, targetName, targetPkg string) string {
+	var init, post string
+	{
+		scope := codegen.NewNameScope()
+		scope.Unique(targetVar)
+
+		if code == "" {
+			init = fmt.Sprintf("%s := &%s{\n", targetVar, targetName)
+		}
+		for _, arg := range args {
+			if arg.FieldName == "" {
+				continue
+			}
+			if expr.Equal(arg.Type, arg.FieldType) {
+				// arg type and the data structure field type are the same
+				deref := ""
+				if !arg.Pointer && arg.FieldPointer && expr.IsPrimitive(arg.FieldType) {
+					deref = "&"
+				}
+				if code != "" {
+					post += fmt.Sprintf("%s.%s = %s%s\n", targetVar, arg.FieldName, deref, arg.Name)
+					continue
+				}
+				init += fmt.Sprintf("%s: %s%s,\n", arg.FieldName, deref, arg.Name)
+			} else if _, isut := arg.FieldType.(expr.UserType); isut && expr.IsPrimitive(arg.FieldType) {
+				// aliased primitive type
+				t := scope.GoFullTypeRef(&expr.AttributeExpr{Type: arg.FieldType}, targetPkg)
+				cast := fmt.Sprintf("%s(%s)", t, arg.Name)
+				if arg.Pointer {
+					cast = fmt.Sprintf("%s(*%s)", t, arg.Name)
+				}
+				if arg.FieldPointer {
+					post += fmt.Sprintf("tmp%s := %s\n%s.%s = &tmp%s\n", arg.Name, cast, targetVar, arg.FieldName, arg.Name)
+					continue
+				}
+				if code != "" {
+					post += fmt.Sprintf("%s.%s = %s\n", targetVar, arg.FieldName, cast)
+					continue
+				}
+				init += fmt.Sprintf("%s: %s,\n", arg.FieldName, cast)
+			} else {
+				// aliased non-primitive type (array or map). We can assume that the
+				// array and map elements never contains another user type because
+				// goa does not allow user types to be sent over params and headers
+				srcctx := codegen.NewAttributeContext(arg.Pointer, false, true, "", scope)
+				tgtctx := codegen.NewAttributeContext(arg.FieldPointer, false, true, targetPkg, scope)
+				c, h, err := codegen.GoTransformToVar(
+					&expr.AttributeExpr{Type: arg.Type}, &expr.AttributeExpr{Type: arg.FieldType},
+					arg.Name, fmt.Sprintf("%s.%s", targetVar, arg.FieldName), srcctx, tgtctx, "", false)
+				if err != nil {
+					panic(err) // bug
+				}
+				if len(h) > 0 {
+					// bug. A user type is used in params/headers which is not allowed.
+					// Fix validation to catch these.
+					panic("expected 0 transform helpers but got at least 1")
+				}
+				post += c + "\n"
+			}
+		}
+		if init != "" {
+			init += "}\n"
+		}
+	}
+	if code != "" {
+		return strings.Trim(post, "\n")
+	}
+	return strings.Trim(init+post, "\n")
+}
+
 // input: TypeData
 const typeDeclT = `{{ comment .Description }}
 type {{ .VarName }} {{ .Def }}
@@ -209,32 +288,28 @@ type {{ .VarName }} {{ .Def }}
 // input: InitData
 const serverTypeInitT = `{{ comment .Description }}
 func {{ .Name }}({{- range .ServerArgs }}{{ .Name }} {{ .TypeRef }}, {{ end }}) {{ .ReturnTypeRef }} {
-	{{- if .ServerCode }}
-		{{ .ServerCode }}
-		{{- if .ReturnTypeAttribute }}
+{{- if .ServerCode }}
+	{{ .ServerCode }}
+	{{- if .ReturnTypeAttribute }}
 		res := &{{ .ReturnTypeName }}{
 			{{ .ReturnTypeAttribute }}: v,
 		}
+	{{- end }}
+{{- end }}
+{{- if .ReturnIsStruct }}
+	{{- if .ReturnTypeAttribute }}
+		{{- $code := (fieldCode .ServerArgs .ServerCode "res" .ReturnTypeName .ReturnTypePkg) }}
+		{{- if $code }}
+			{{ $code }}
 		{{- end }}
-		{{- if .ReturnIsStruct }}
-			{{- range .ServerArgs }}
-				{{- if .FieldName }}
-			{{ if $.ReturnTypeAttribute }}res{{ else }}v{{ end }}.{{ .FieldName }} = {{ if and (not .Pointer) .FieldPointer }}&{{ end }}{{ .Name }}
-				{{- end }}
-			{{- end }}
-		{{- end }}
-		return {{ if .ReturnTypeAttribute }}res{{ else }}v{{ end }}
 	{{- else }}
-		{{- if .ReturnIsStruct }}
-			return &{{ .ReturnTypeName }}{
-			{{- range .ServerArgs }}
-				{{- if .FieldName }}
-				{{ .FieldName }}: {{ if and (not .Pointer) .FieldPointer }}&{{ end }}{{ .Name }},
-				{{- end }}
-			{{- end }}
-			}
+		{{- $code := (fieldCode .ServerArgs .ServerCode "v" .ReturnTypeName .ReturnTypePkg) }}
+		{{- if $code }}
+			{{ $code }}
 		{{- end }}
-	{{ end -}}
+	{{- end }}
+{{- end }}
+	return {{ if .ReturnTypeAttribute }}res{{ else }}v{{ end }}
 }
 `
 
